@@ -1,0 +1,40 @@
+# Secrets
+.env
+.env.local
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Data artifacts (do not commit raw or processed health data)
+data/raw/
+data/interim/
+data/processed/
+*.parquet
+*.csv
+!data/sample/*.csv
+
+# Plots
+plots/
+*.png
+*.html
+!docs/*.png
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
