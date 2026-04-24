@@ -6,6 +6,8 @@ Sections (sidebar nav):
   Timeline  — interactive glucose chart with bolus pins, IOB overlay,
               and date-range filter.
   Stats     — time-in-range, gap detection, null counts.
+  Model     — train, evaluate, and explain the XGBoost predictor.
+  Predict   — current 30-min forecast + backtest predicted-vs-actual.
 
 Run with:
     streamlit run app.py
@@ -13,6 +15,7 @@ Run with:
 from __future__ import annotations
 
 import io
+import json
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -24,13 +27,28 @@ import streamlit as st
 REPO = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO))
 
-from src import ingest_dexcom, ingest_tandem, merge_pipeline, validate_pipeline  # noqa: E402
+from src import (  # noqa: E402
+    explain as explain_mod,
+    features as feat_mod,
+    ingest_dexcom,
+    ingest_tandem,
+    merge_pipeline,
+    predict as predict_mod,
+    train as train_mod,
+    validate_pipeline,
+)
 
 DATA_DIR = REPO / "data" / "processed"
 RAW_DIR = REPO / "data" / "raw"
+MODEL_DIR = REPO / "data" / "models"
 DEXCOM_PARQUET = DATA_DIR / "dexcom_clean.parquet"
 TANDEM_PARQUET = DATA_DIR / "tandem_clean.parquet"
 UNIFIED_PARQUET = DATA_DIR / "unified_timeline.parquet"
+FEATURES_PARQUET = DATA_DIR / "features.parquet"
+MODEL_PATH = MODEL_DIR / "xgb_glucose_30m.json"
+METRICS_PATH = MODEL_DIR / "metrics.json"
+IMPORTANCE_PATH = MODEL_DIR / "feature_importance.parquet"
+LOCAL_EXPL_PATH = MODEL_DIR / "latest_explanation.json"
 
 st.set_page_config(page_title="T1D Glucose Pipeline", page_icon="🩸", layout="wide")
 
@@ -61,13 +79,22 @@ def _load_unified() -> pd.DataFrame | None:
 # ---------- sidebar ----------------------------------------------------------
 
 st.sidebar.title("🩸 T1D Pipeline")
-section = st.sidebar.radio("Section", ["Pipeline", "Timeline", "Stats"], label_visibility="collapsed")
+section = st.sidebar.radio(
+    "Section",
+    ["Pipeline", "Timeline", "Stats", "Model", "Predict"],
+    label_visibility="collapsed",
+)
 
 st.sidebar.divider()
 st.sidebar.caption("Artifacts")
 st.sidebar.write(f"**dexcom**: `{_file_status(DEXCOM_PARQUET)}`")
 st.sidebar.write(f"**tandem**: `{_file_status(TANDEM_PARQUET)}`")
 st.sidebar.write(f"**unified**: `{_file_status(UNIFIED_PARQUET)}`")
+st.sidebar.write(f"**features**: `{_file_status(FEATURES_PARQUET)}`")
+st.sidebar.write(f"**model**: `{_file_status(MODEL_PATH)}`")
+
+st.sidebar.divider()
+st.sidebar.caption("[ML primer for non-ML readers](docs/ML_PRIMER.md)")
 
 
 # ---------- Pipeline section -------------------------------------------------
@@ -227,7 +254,7 @@ elif section == "Timeline":
 
 # ---------- Stats section ----------------------------------------------------
 
-else:  # Stats
+elif section == "Stats":
     st.title("Stats")
     df = _load_unified()
     if df is None:
@@ -280,3 +307,205 @@ else:  # Stats
         file_name="unified_timeline.csv",
         mime="text/csv",
     )
+
+
+# ---------- Model section ----------------------------------------------------
+
+elif section == "Model":
+    st.title("Model")
+    st.caption(
+        "Predicts glucose **30 minutes ahead** using XGBoost — gradient-boosted "
+        "decision trees. See `docs/ML_PRIMER.md` for plain-English context."
+    )
+
+    if not UNIFIED_PARQUET.exists():
+        st.info("No unified timeline yet. Run Phase 3 on the Pipeline tab first.")
+        st.stop()
+
+    # --- Build features --------------------------------------------------
+    st.subheader("Features")
+    with st.container(border=True):
+        st.markdown(
+            "Builds lag (5/10/15/30/60/120/240 min), rolling stats, IOB-context, "
+            "and circadian features. Every row gets a `target_30m` label = glucose "
+            "30 min later. **No future leakage**: features are functions of past "
+            "data only."
+        )
+        col_a, col_b = st.columns([1, 3])
+        with col_a:
+            run_feats = st.button("Build features", type="primary")
+        with col_b:
+            st.write(f"Output → `{FEATURES_PARQUET.relative_to(REPO)}`")
+        if run_feats:
+            with st.spinner("Engineering features…"):
+                try:
+                    feats = feat_mod.run(UNIFIED_PARQUET, FEATURES_PARQUET)
+                    st.success(f"Built {len(feats):,} rows × {len(feats.columns)} columns.")
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"Feature build failed: {e}")
+
+    # --- Train -----------------------------------------------------------
+    st.subheader("Train")
+    with st.container(border=True):
+        st.markdown(
+            "**Walk-forward split** in chronological order: 70% train / 15% validation "
+            "/ 15% test. The model never sees the test window during training, which "
+            "is the only honest way to estimate future-period accuracy. Early stopping "
+            "is on the validation set."
+        )
+        col_a, col_b = st.columns([1, 3])
+        with col_a:
+            run_train = st.button(
+                "Train XGBoost",
+                type="primary",
+                disabled=not FEATURES_PARQUET.exists(),
+                help=None if FEATURES_PARQUET.exists() else "Build features first",
+            )
+        with col_b:
+            st.write(f"Output → `{MODEL_DIR.relative_to(REPO)}/`")
+
+        if run_train:
+            with st.spinner("Training… (early stopping, usually 5-30s)"):
+                try:
+                    result = train_mod.run(FEATURES_PARQUET, MODEL_DIR)
+                    m = result["metrics"]
+                    st.success(
+                        f"Done — test MAE = {m['mae']:.2f} mg/dL on "
+                        f"{m['test_rows']:,} held-out rows."
+                    )
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"Training failed: {e}")
+
+    # --- Metrics + Importance --------------------------------------------
+    if METRICS_PATH.exists():
+        st.subheader("Test-set performance")
+        st.caption("All metrics computed on data the model **never saw** during training.")
+        m = json.loads(METRICS_PATH.read_text())
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("MAE (mg/dL)", f"{m['mae']:.1f}",
+                  help="Mean absolute error. Average miss in mg/dL. 12-18 is competitive for 30-min horizon.")
+        c2.metric("RMSE (mg/dL)", f"{m['rmse']:.1f}",
+                  help="Root mean squared error. Penalizes big misses more.")
+        c3.metric("Within ±20 mg/dL", f"{m['pct_within_20']:.1f}%",
+                  help="Fraction of predictions within 20 mg/dL of truth.")
+        hr = m.get("hypo_recall")
+        c4.metric("Hypo recall", f"{hr:.2f}" if isinstance(hr, (int, float)) and not pd.isna(hr) else "n/a",
+                  help="Of actual lows (<70), fraction we predicted to be <80. Higher = safer.")
+        with st.expander("Full metrics JSON"):
+            st.json(m)
+
+    # --- Run explainability ---------------------------------------------
+    st.subheader("Explain")
+    with st.container(border=True):
+        st.markdown(
+            "**SHAP values** decompose every prediction into per-feature contributions. "
+            "Below: each feature's *average* impact on the prediction (mean |SHAP|). "
+            "If a recent-glucose feature isn't on top, something is wrong."
+        )
+        col_a, col_b = st.columns([1, 3])
+        with col_a:
+            run_expl = st.button(
+                "Compute SHAP",
+                type="primary",
+                disabled=not MODEL_PATH.exists(),
+                help=None if MODEL_PATH.exists() else "Train the model first",
+            )
+        with col_b:
+            st.write(f"Sample size: 2,000 rows (capped for speed).")
+        if run_expl:
+            with st.spinner("Computing SHAP…"):
+                try:
+                    explain_mod.run(FEATURES_PARQUET, MODEL_DIR, MODEL_DIR, sample_size=2000)
+                    st.success("SHAP computed.")
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"SHAP failed: {e}")
+
+    if IMPORTANCE_PATH.exists():
+        importance = pd.read_parquet(IMPORTANCE_PATH).head(20)
+        st.bar_chart(importance.set_index("feature")["mean_abs_shap"], height=420)
+        with st.expander("Full importance table"):
+            st.dataframe(pd.read_parquet(IMPORTANCE_PATH), width="stretch", hide_index=True)
+
+
+# ---------- Predict section --------------------------------------------------
+
+elif section == "Predict":
+    st.title("Predict")
+    st.caption(
+        "Live 30-minute forecast for the most recent reading, plus a backtest of the "
+        "model's predictions vs. what actually happened."
+    )
+
+    if not MODEL_PATH.exists() or not FEATURES_PARQUET.exists():
+        st.info("Build features and train the model on the **Model** tab first.")
+        st.stop()
+
+    feats = pd.read_parquet(FEATURES_PARQUET)
+
+    # --- Live forecast --------------------------------------------------
+    st.subheader("Latest forecast")
+    try:
+        model, feature_cols = predict_mod.load_model(MODEL_DIR)
+        latest = predict_mod.predict_latest(model, feature_cols, feats)
+    except Exception as e:  # noqa: BLE001
+        st.error(f"Prediction failed: {e}")
+        st.stop()
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Current glucose", f"{latest['current_glucose']:.0f} mg/dL")
+    c2.metric("Predicted in 30 min", f"{latest['prediction_30m']:.0f} mg/dL",
+              delta=f"{latest['predicted_change']:+.0f} mg/dL")
+    c3.metric("As of (UTC)", latest["as_of"].split("+")[0].replace("T", " "))
+
+    # --- Local explanation for that prediction --------------------------
+    st.subheader("Why this prediction?")
+    st.caption("Top features contributing to the latest forecast (positive = pushing up, negative = pulling down).")
+    if LOCAL_EXPL_PATH.exists():
+        local = json.loads(LOCAL_EXPL_PATH.read_text())
+        contrib_df = pd.DataFrame(local["contributions"])
+        if not contrib_df.empty:
+            contrib_df["sign"] = contrib_df["shap"].apply(lambda v: "+" if v >= 0 else "−")
+            st.dataframe(
+                contrib_df[["feature", "value", "shap"]].rename(columns={"shap": "contribution_mg_dl"}),
+                width="stretch", hide_index=True,
+            )
+            st.caption(f"Baseline (model average): **{local['baseline']:.1f} mg/dL** · "
+                       f"Sum of contributions = prediction.")
+    else:
+        st.info("Run **Explain → Compute SHAP** on the Model tab to see the breakdown.")
+
+    # --- Backtest chart -------------------------------------------------
+    st.subheader("Backtest — predicted vs actual")
+    st.markdown(
+        "Predictions are computed for *every* row, including training data. The "
+        "test window is the rightmost ~15% of the timeline; that's the slice that "
+        "honestly measures generalization."
+    )
+    backtest = predict_mod.predict_dataframe(model, feature_cols, feats)
+    backtest = backtest.dropna(subset=["actual_30m"])
+
+    if len(backtest) > 5000:
+        backtest_view = backtest.tail(2000)
+        st.caption("Showing last 2,000 rows for readability.")
+    else:
+        backtest_view = backtest
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=backtest_view["timestamp"], y=backtest_view["actual_30m"],
+        name="Actual (t+30m)", line=dict(color="#1f77b4", width=1.2),
+    ))
+    fig.add_trace(go.Scatter(
+        x=backtest_view["timestamp"], y=backtest_view["prediction_30m"],
+        name="Predicted (t+30m)", line=dict(color="#d62728", width=1.0, dash="dot"),
+    ))
+    fig.add_hrect(y0=70, y1=180, fillcolor="green", opacity=0.06, line_width=0)
+    fig.update_layout(
+        height=420, yaxis_title="mg/dL", xaxis_title="UTC",
+        legend=dict(orientation="h"),
+    )
+    st.plotly_chart(fig, width="stretch")
+
+    overall_mae = backtest["abs_error"].mean()
+    st.caption(f"Across all {len(backtest):,} rows: MAE = **{overall_mae:.2f} mg/dL** "
+               "(includes training data — your test-set MAE on the Model tab is the honest one).")

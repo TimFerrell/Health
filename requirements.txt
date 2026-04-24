@@ -5,6 +5,7 @@ python-dotenv>=1.0
 matplotlib>=3.8
 plotly>=5.20
 streamlit>=1.32
+scikit-learn>=1.4
 xgboost>=2.0
 shap>=0.45
 requests>=2.32

@@ -23,6 +23,9 @@ dist/
 data/raw/
 data/interim/
 data/processed/
+data/models/
+data/smoke/
+data/smoke_ml/
 *.parquet
 *.csv
 !data/sample/*.csv

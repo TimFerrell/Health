@@ -9,18 +9,26 @@ This repo covers **data only** — no model training yet.
 ## Layout
 
 ```
-app.py                 # Streamlit UI (Pipeline / Timeline / Stats)
+app.py                 # Streamlit UI (Pipeline / Timeline / Stats / Model / Predict)
+docs/
+  ML_PRIMER.md         # Plain-English explainer for non-ML readers
 src/
   ingest_dexcom.py     # Phase 1 — Clarity CSV -> dexcom_clean.parquet
   ingest_tandem.py     # Phase 2 — tconnectsync -> tandem_clean.parquet
                        #           (synthetic fallback if API breaks)
   merge_pipeline.py    # Phase 3 — 5-min unified timeline
   validate_pipeline.py # Phase 4 — EDA, gap detection, time-in-range
+  features.py          # Phase 5 — lag/rolling/time features + 30m label
+  train.py             # Phase 6 — walk-forward split + XGBoost
+  predict.py           # Phase 7 — inference (latest + backtest)
+  explain.py           # Phase 8 — SHAP global + local explanations
 scripts/
-  _smoke_test.py       # End-to-end canary (uses synthetic data)
+  _smoke_test.py       # Data-pipeline canary (Phases 1-4)
+  _smoke_ml.py         # ML-pipeline canary (Phases 5-8)
 data/
   raw/                 # untracked: drop Clarity CSV exports here
   processed/           # untracked: parquet outputs land here
+  models/              # untracked: saved model + metrics + SHAP
 plots/                 # untracked: validation plots
 ```
 
@@ -161,8 +169,43 @@ clinical decision system.
 - Each phase is independently runnable so you can re-run a single
   stage without re-doing the whole pipeline.
 
-## Not included (yet)
+## ML pipeline (Phases 5-8)
 
-- XGBoost training (Phase 5)
-- SHAP explainability (Phase 6)
-- Online inference / scoring service
+If you're not an ML person, **read [`docs/ML_PRIMER.md`](docs/ML_PRIMER.md) first** —
+it explains the model, features, splits, metrics, and SHAP in plain English.
+
+```bash
+# Phase 5 — engineer features (lag, rolling, IOB context, circadian)
+python -m src.features --input data/processed/unified_timeline.parquet \
+    -o data/processed/features.parquet
+
+# Phase 6 — train XGBoost with walk-forward split + early stopping
+python -m src.train --features data/processed/features.parquet \
+    --model-dir data/models
+
+# Phase 7 — produce predictions (--latest for current 30-min forecast)
+python -m src.predict --features data/processed/features.parquet \
+    --model-dir data/models --latest
+
+# Phase 8 — SHAP feature importance + local explanation
+python -m src.explain --features data/processed/features.parquet \
+    --model-dir data/models
+```
+
+### What "good" looks like
+For a child's 30-minute glucose forecast on real CGM + pump data, a
+**test-set MAE of 12-18 mg/dL** is competitive with published baselines.
+Below ~10 is suspicious (probably a leak — see ML_PRIMER §"naive splits
+cheat"). Above 25 means the model is struggling — check the validation
+parquet for gaps, sensor noise, or unlogged meals.
+
+### What this model **cannot** do
+- Predict spikes from un-bolused meals.
+- React to exercise, illness, stress, or hormonal shifts.
+- Substitute for clinical judgment. **Use for insight only — never dose
+  insulin from these predictions.**
+
+## ML smoke test
+```bash
+python scripts/_smoke_ml.py    # synthesizes 60 days, runs phases 5-8 end-to-end
+```
