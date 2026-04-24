@@ -9,6 +9,7 @@ This repo covers **data only** — no model training yet.
 ## Layout
 
 ```
+app.py                 # Streamlit UI (Pipeline / Timeline / Stats)
 src/
   ingest_dexcom.py     # Phase 1 — Clarity CSV -> dexcom_clean.parquet
   ingest_tandem.py     # Phase 2 — tconnectsync -> tandem_clean.parquet
@@ -68,6 +69,22 @@ Smoke test (uses synthetic Dexcom + Tandem data, no credentials needed):
 ```bash
 python scripts/_smoke_test.py
 ```
+
+## UI
+
+A light Streamlit app drives the same modules from a browser:
+
+```bash
+streamlit run app.py
+```
+
+Sections:
+- **Pipeline** — upload a Clarity CSV, pick a Tandem date range, run any
+  phase with a button. Shows artifact freshness in the sidebar.
+- **Timeline** — interactive plotly chart with bolus pins, CIQ suspend
+  markers, and a glucose vs IOB overlay. Date-range filter at the top.
+- **Stats** — TIR metrics, null counts, gap detection, pump activity
+  summary, plus a CSV export of the unified timeline.
 
 ## Output schema (`unified_timeline.parquet`)
 
