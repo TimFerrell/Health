@@ -1,0 +1,51 @@
+<?xml version="1.0"?>
+<!--
+  Unraid container template for t1d-pipeline.
+
+  Two ways to use this:
+
+  1) Compose route (recommended):
+       Install the "Compose Manager" plugin, copy docker-compose.yml
+       into a new stack, edit the volume host path if needed, and hit
+       Compose Up. Done.
+
+  2) Manual route via this template:
+       a) Build the image on Unraid:
+            cd /mnt/user/appdata/t1d-pipeline-src && git clone <repo> .
+            docker build -t t1d-pipeline:latest .
+       b) Docker tab → Add Container → "Template" → paste the URL of
+          this XML, or import it locally.
+-->
+<Container version="2">
+  <Name>t1d-pipeline</Name>
+  <Repository>t1d-pipeline:latest</Repository>
+  <Registry/>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>bash</Shell>
+  <Privileged>false</Privileged>
+  <Support/>
+  <Project>https://github.com/TimFerrell/Health</Project>
+  <Overview>Streamlit UI + ML pipeline for predicting glucose from Dexcom G7 CGM and Tandem Mobi pump data. See docs/ML_PRIMER.md for non-ML readers.</Overview>
+  <Category>HomeAutomation: Productivity:</Category>
+  <WebUI>http://[IP]:[PORT:8501]</WebUI>
+  <TemplateURL/>
+  <Icon>https://raw.githubusercontent.com/streamlit/streamlit/develop/frontend/public/favicon.png</Icon>
+  <ExtraParams>--restart unless-stopped</ExtraParams>
+  <PostArgs/>
+  <CPUset/>
+  <DateInstalled/>
+  <DonateText/>
+  <DonateLink/>
+  <Description>Local-only T1D glucose prediction pipeline. Ingests Dexcom Clarity CSVs and Tandem Mobi pump events, builds a unified 5-min timeline, trains an XGBoost 30-min forecast model, and exposes everything through a Streamlit UI. Health data stays on the bind-mounted appdata volume — never leaves your server.</Description>
+
+  <Config Name="WebUI" Target="8501" Default="8501" Mode="tcp" Description="Streamlit port" Type="Port" Display="always" Required="true" Mask="false">8501</Config>
+
+  <Config Name="Data" Target="/data" Default="/mnt/user/appdata/t1d-pipeline" Mode="rw" Description="Persistent storage for raw CSVs, processed parquets, and the trained model." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/t1d-pipeline</Config>
+
+  <Config Name="TCONNECT_EMAIL" Target="TCONNECT_EMAIL" Default="" Mode="" Description="Tandem t:connect login email. Leave blank to force synthetic pump data." Type="Variable" Display="always" Required="false" Mask="false"></Config>
+
+  <Config Name="TCONNECT_PASSWORD" Target="TCONNECT_PASSWORD" Default="" Mode="" Description="Tandem t:connect password. Leave blank to force synthetic pump data." Type="Variable" Display="always" Required="false" Mask="true"></Config>
+
+  <Config Name="Timezone" Target="TZ" Default="America/New_York" Mode="" Description="Timezone (e.g. America/New_York). Used for display only — all storage is UTC." Type="Variable" Display="always" Required="false" Mask="false">America/New_York</Config>
+</Container>

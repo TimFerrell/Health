@@ -1,0 +1,41 @@
+# Drop this into Unraid's "Compose Manager" plugin or run with
+# `docker compose up -d` on any host. Bind mounts use the standard
+# Unraid appdata layout.
+
+services:
+  t1d-pipeline:
+    build:
+      context: .
+      args:
+        # Match Unraid's default "nobody:users". Override on Linux
+        # hosts where your UID/GID differ.
+        PUID: 99
+        PGID: 100
+    image: t1d-pipeline:latest
+    container_name: t1d-pipeline
+    restart: unless-stopped
+    ports:
+      # host:container — change the host side if 8501 is taken on
+      # your Unraid box.
+      - "8501:8501"
+    volumes:
+      # All persistent state lives in one bind mount: raw CSVs,
+      # processed parquets, the trained model. Survives container
+      # rebuilds and updates.
+      - /mnt/user/appdata/t1d-pipeline:/data
+    environment:
+      # Tandem t:connect credentials — leave blank to force the
+      # synthetic-data fallback. Override via Unraid's container
+      # template UI rather than committing real values here.
+      TCONNECT_EMAIL: ""
+      TCONNECT_PASSWORD: ""
+      # Optional: pin a default Tandem ingestion window
+      # TANDEM_START_DATE: "2026-03-25"
+      # TANDEM_END_DATE:   "2026-04-24"
+      TZ: America/New_York
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8501/_stcore/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

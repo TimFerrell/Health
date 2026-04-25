@@ -209,3 +209,79 @@ parquet for gaps, sensor noise, or unlogged meals.
 ```bash
 python scripts/_smoke_ml.py    # synthesizes 60 days, runs phases 5-8 end-to-end
 ```
+
+## Deploying on Unraid (Docker)
+
+The repo ships a `Dockerfile`, a `docker-compose.yml`, and an Unraid
+template. Two paths:
+
+### Option A — Compose Manager plugin (recommended)
+
+1. **Community Applications → Compose Manager** (install the plugin
+   if you haven't).
+2. Add a new stack, name it `t1d-pipeline`, paste the contents of
+   `docker-compose.yml`. Adjust the host bind path if you don't use
+   `/mnt/user/appdata/t1d-pipeline`.
+3. Stack → **Up**. First build takes ~3-5 min while it pulls the
+   wheels for pandas / xgboost / streamlit; subsequent rebuilds are
+   cached.
+4. Open `http://<unraid-ip>:8501`.
+5. Drop your Clarity CSV in the file uploader on the Pipeline tab,
+   or `cp` it into `/mnt/user/appdata/t1d-pipeline/raw/` first.
+
+### Option B — Manual container
+
+1. SSH into Unraid, clone the repo somewhere persistent:
+   ```bash
+   mkdir -p /mnt/user/appdata/t1d-pipeline-src
+   cd /mnt/user/appdata/t1d-pipeline-src
+   git clone <repo-url> .
+   docker build -t t1d-pipeline:latest .
+   ```
+2. **Docker** tab → **Add Container**. Paste the contents of
+   `unraid-template.xml` into the *Template* field, or import it via
+   URL.
+3. Bind path: `/mnt/user/appdata/t1d-pipeline` → `/data`.
+4. Apply, wait for green status, click **WebUI**.
+
+### Persistent state
+
+The container writes everything to `/data` (a single bind mount):
+
+```
+/data/raw/         # uploaded Clarity CSVs
+/data/processed/   # parquets (Phases 1-4 + features)
+/data/models/      # trained XGBoost model + metrics + SHAP
+/data/plots/       # matplotlib outputs (if the CLI is run inside)
+```
+
+Survives container rebuilds, image updates, and Unraid reboots.
+
+### Security notes
+
+- **Streamlit has no built-in authentication.** Don't expose port 8501
+  to the public internet. Either keep access on the LAN/VPN, or put it
+  behind your existing reverse proxy (Nginx Proxy Manager + Authelia /
+  Tailscale Funnel / Cloudflare Tunnel access policy).
+- Tandem credentials should be set via the container's environment
+  variables (Unraid's UI handles this), not committed to the repo.
+- The `.env` file is git-ignored and is not baked into the image —
+  `tconnectsync` reads creds from the container env at runtime.
+- All traffic between the container and Dexcom Clarity is one-way
+  (you upload a CSV); the only outbound network call is the optional
+  `tconnectsync` request to Tandem.
+
+### Updating
+
+```bash
+cd /mnt/user/appdata/t1d-pipeline-src
+git pull
+docker compose up -d --build         # Compose route
+# or
+docker build -t t1d-pipeline:latest . # manual route, then restart container
+```
+
+### CPU / memory
+
+XGBoost training + SHAP on ~60 days of 5-min data uses < 1 GB RAM and
+finishes in 10-30 seconds on a modest CPU. No GPU needed.

@@ -1,0 +1,36 @@
+.git
+.gitignore
+.github
+.venv
+venv
+env
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+.ruff_cache
+*.egg-info
+build
+dist
+
+# Never bake host data into the image — it gets bind-mounted at runtime
+data/raw
+data/processed
+data/models
+data/smoke
+data/smoke_ml
+plots
+
+# Local secrets — must come from env vars at runtime
+.env
+.env.local
+
+# Editor / OS noise
+.DS_Store
+.idea
+.vscode
+*.swp
+
+# Docs that aren't needed at runtime (kept docs/ in image for in-app links)
+README.md
