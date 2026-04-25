@@ -39,3 +39,34 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+
+  # Background scheduler: every REFRESH_INTERVAL seconds, pull recent
+  # CGM + pump events, re-merge, re-feature, predict, log, and run
+  # anomaly detection. Shares the same /data volume as the UI so its
+  # writes show up immediately in the Live tab.
+  refresh-scheduler:
+    image: t1d-pipeline:latest    # built by the t1d-pipeline service
+    container_name: t1d-refresh
+    restart: unless-stopped
+    depends_on:
+      - t1d-pipeline
+    volumes:
+      - /mnt/user/appdata/t1d-pipeline:/data
+    environment:
+      DEXCOM_USERNAME: ""
+      DEXCOM_PASSWORD: ""
+      DEXCOM_REGION: "us"
+      TCONNECT_EMAIL: ""
+      TCONNECT_PASSWORD: ""
+      TZ: America/New_York
+      REFRESH_INTERVAL: "300"     # seconds (Dexcom Share emits every 5 min)
+    # Override the UI's CMD with the refresh loop. --skip-pump is on by
+    # default; remove it once you want the scheduler to also poll
+    # tconnectsync (it's heavier and most of the predictive value is in
+    # the CGM stream).
+    command: >
+      python -m src.refresh
+        --loop
+        --interval ${REFRESH_INTERVAL:-300}
+        --dexcom-minutes 360
+        --skip-pump

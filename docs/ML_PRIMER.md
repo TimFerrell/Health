@@ -221,6 +221,96 @@ Read this section twice.
 - `src/train.py` — the train/val/test split + XGBoost config.
 - `src/predict.py` — produce predictions on new data.
 - `src/explain.py` — SHAP global + local explanations.
+- `src/anomaly.py` — threshold rules that turn a forecast into alerts.
+- `src/drift.py` — rolling live accuracy, retrain trigger.
+- `src/counterfactual.py` — "what if" simulator over the trained model.
+- `src/refresh.py` — orchestrator that chains it all together every 5 min.
 
 Open any of those files alongside this primer and the comments should
 read like a guided tour.
+
+---
+
+## Live extras (Phases 11-13)
+
+### Anomaly detection — alerts in plain English
+
+Once we have a 30-minute forecast, we run a handful of simple
+thresholds against it. No learning, no surprise — just rules:
+
+| Rule              | Triggers when                                                    | Severity |
+|-------------------|------------------------------------------------------------------|----------|
+| `predicted_low`   | Forecast < 70 mg/dL                                              | critical |
+| `predicted_drop`  | Forecast is ≥ 50 mg/dL lower than current                        | warn     |
+| `predicted_high`  | Forecast > 250 mg/dL                                             | warn     |
+| `predicted_rise`  | Forecast is ≥ 60 mg/dL higher than current                       | info     |
+| `stale_data`      | Most recent CGM reading is > 15 min old                          | warn     |
+| `sensor_extreme`  | Current glucose hit the Low (39) or High (401) sensor sentinel   | critical |
+
+Thresholds live at the top of `src/anomaly.py` and are easy to tune.
+These are **decision-support rules, not a clinical alert system.**
+They fire on *the model's* forecast — if the model is wrong, the alert
+is wrong too.
+
+### Drift — "is the model still good?"
+
+Every refresh logs the prediction it made for the next 30 min. Thirty
+minutes later, the actual glucose for that same timestamp is in the
+unified timeline. By joining those two we get a stream of
+"prediction error after the fact" — exactly the same MAE / RMSE we
+computed on the test set during training, but on **live data**.
+
+Why this matters: a child's insulin needs change with growth, school
+schedule, illness, hormones, and seasons. A model trained in March
+will silently get worse by July if no one's watching. The drift
+dashboard flags this:
+
+> **Drift ratio** = (live 24h MAE) / (trained-test MAE)
+>
+> < 1.2  → green, model is fine.
+> 1.2-1.5 → yellow, drift starting; keep an eye on it.
+> > 1.5 → red, retrain recommended.
+
+We **don't auto-retrain** because retraining on bad data (sensor
+miscalibration, a faulty pump site) would entrench the badness.
+Retraining is a deliberate action you take from the Model tab.
+
+### Counterfactuals — "what would have happened if…?"
+
+This deserves its own section because it's the most powerful — and
+most easily misused — live feature.
+
+A counterfactual asks the model: *"if a 2U bolus had just been
+delivered, what would you predict glucose to be in 30 min?"* We answer
+this without giving any insulin, by:
+
+1. Taking the current feature row (IOB, recent boluses, basal, etc.).
+2. Mechanically modifying it to reflect the action — for a 2U bolus,
+   that means adding 2 to every "bolus units in the last N min" feature,
+   adding 2 to the current IOB feature, and resetting "minutes since last
+   bolus" to 0.
+3. Re-running the model on both the original and the modified row.
+4. Reporting the difference.
+
+So if the baseline forecast is 195 and the with-bolus forecast is 168,
+the model believes that bolus would pull the 30-min glucose down by
+about 27 mg/dL.
+
+**What it's good for:**
+- Sanity-checking what the algorithm thinks about an action you're
+  considering.
+- Comparing several actions side-by-side ("0.5 vs 1 vs 2U?").
+- Friendlier alerts: instead of just "predicted low", surface "predicted
+  low — but if you eat 8g, predicted bottom is 78".
+
+**What it can't do:**
+- Simulate the body. It only knows what the model has learned. If the
+  data never showed a 5U bolus at 3am for a kid this size, asking
+  about that is extrapolation.
+- Replace clinical judgement. **Never dose insulin from a counterfactual.**
+- Account for things outside its features — carbs aren't in the model,
+  so a "what if I eat 30g" counterfactual is impossible (yet).
+
+Carbs would be the natural next addition: log them in the UI, add a
+"recent carbs in last N min" feature, retrain, and "what if I eat 30g"
+becomes a real question we can ask.

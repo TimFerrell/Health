@@ -28,12 +28,16 @@ REPO = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO))
 
 from src import (  # noqa: E402
+    anomaly,
+    counterfactual,
+    drift,
     explain as explain_mod,
     features as feat_mod,
     ingest_dexcom,
     ingest_tandem,
     merge_pipeline,
     predict as predict_mod,
+    refresh as refresh_mod,
     train as train_mod,
     validate_pipeline,
 )
@@ -49,6 +53,8 @@ MODEL_PATH = MODEL_DIR / "xgb_glucose_30m.json"
 METRICS_PATH = MODEL_DIR / "metrics.json"
 IMPORTANCE_PATH = MODEL_DIR / "feature_importance.parquet"
 LOCAL_EXPL_PATH = MODEL_DIR / "latest_explanation.json"
+PREDICTIONS_LOG = DATA_DIR / "predictions_log.parquet"
+ALERTS_LOG = DATA_DIR / "alerts_log.parquet"
 
 st.set_page_config(page_title="T1D Glucose Pipeline", page_icon="🩸", layout="wide")
 
@@ -81,7 +87,7 @@ def _load_unified() -> pd.DataFrame | None:
 st.sidebar.title("🩸 T1D Pipeline")
 section = st.sidebar.radio(
     "Section",
-    ["Pipeline", "Timeline", "Stats", "Model", "Predict"],
+    ["Live", "Pipeline", "Timeline", "Stats", "Model", "Predict", "What-if"],
     label_visibility="collapsed",
 )
 
@@ -97,9 +103,136 @@ st.sidebar.divider()
 st.sidebar.caption("[ML primer for non-ML readers](docs/ML_PRIMER.md)")
 
 
+# ---------- Live section -----------------------------------------------------
+
+if section == "Live":
+    st.title("Live")
+    st.caption(
+        "Real-time view: current glucose, the model's 30-minute forecast, "
+        "active alerts, and how the model is doing against reality."
+    )
+
+    col_a, col_b, col_c = st.columns([1, 1, 3])
+    with col_a:
+        run_now = st.button("Refresh now", type="primary",
+                            help="Pulls the last 24 h of CGM, re-merges, re-features, predicts.")
+    with col_b:
+        auto_refresh_min = st.selectbox("Auto-refresh", [0, 1, 5, 10], index=0,
+                                         help="Set 0 to disable. Server-side rerun in the background.")
+    with col_c:
+        if not MODEL_PATH.exists():
+            st.warning("No trained model yet — go to **Model** and train first.")
+
+    if run_now:
+        with st.spinner("Pulling Dexcom Share + pump events, predicting…"):
+            try:
+                result = refresh_mod.cycle()
+                st.success(refresh_mod._summarize(result))
+            except Exception as e:  # noqa: BLE001
+                st.error(f"Refresh failed: {e}")
+
+    # Auto-refresh: fragment-style rerun. Streamlit fires this every N min.
+    if auto_refresh_min:
+        st.caption(f"Auto-refreshing every {auto_refresh_min} min.")
+        st.markdown(
+            f"<meta http-equiv='refresh' content='{auto_refresh_min * 60}'>",
+            unsafe_allow_html=True,
+        )
+
+    # --- Latest prediction --------------------------------------------------
+    if PREDICTIONS_LOG.exists():
+        log = pd.read_parquet(PREDICTIONS_LOG).sort_values("predicted_at")
+        latest = log.iloc[-1]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Current", f"{latest['current_glucose']:.0f} mg/dL")
+        delta = latest["prediction_30m"] - latest["current_glucose"]
+        c2.metric("Predicted (+30m)", f"{latest['prediction_30m']:.0f} mg/dL", delta=f"{delta:+.0f}")
+        c3.metric("As of (UTC)", str(latest["predicted_at"]).split("+")[0].replace("T", " "))
+        # Live alerts (recompute against latest row to reflect any threshold tweaks).
+        alerts = anomaly.detect(
+            current_glucose=float(latest["current_glucose"]),
+            current_timestamp=latest["predicted_at"],
+            prediction_30m=float(latest["prediction_30m"]),
+        )
+        c4.metric("Active alerts", len(alerts))
+
+        if alerts:
+            for a in alerts:
+                if a.severity == "critical":
+                    st.error(f"**{a.type}** — {a.message}")
+                elif a.severity == "warn":
+                    st.warning(f"**{a.type}** — {a.message}")
+                else:
+                    st.info(f"**{a.type}** — {a.message}")
+        else:
+            st.success("No active alerts.")
+
+        # --- Recent predictions chart ---------------------------------------
+        st.subheader("Recent predictions vs. realized glucose")
+        scored = drift.join_with_actuals(log, _load_unified() if UNIFIED_PARQUET.exists() else pd.DataFrame())
+        recent = scored.tail(288)  # last 24h at 5-min cadence
+        fig = go.Figure()
+        fig.add_hrect(y0=70, y1=180, fillcolor="green", opacity=0.06, line_width=0)
+        fig.add_trace(go.Scatter(
+            x=recent["target_timestamp"], y=recent["actual_30m"],
+            name="Actual", line=dict(color="#1f77b4", width=1.4),
+        ))
+        fig.add_trace(go.Scatter(
+            x=recent["target_timestamp"], y=recent["prediction_30m"],
+            name="Predicted (made 30m earlier)", line=dict(color="#d62728", width=1.0, dash="dot"),
+        ))
+        fig.update_layout(height=380, yaxis_title="mg/dL", xaxis_title="UTC",
+                          legend=dict(orientation="h"))
+        st.plotly_chart(fig, width="stretch")
+
+        # --- Drift summary --------------------------------------------------
+        st.subheader("Live accuracy / drift")
+        status = drift.compute_status(PREDICTIONS_LOG, UNIFIED_PARQUET, METRICS_PATH)
+        d1, d2, d3, d4 = st.columns(4)
+        d1.metric("Scored predictions", f"{status.n_scored:,}")
+        d2.metric("MAE — last 24h",
+                  f"{status.mae_24h:.1f}" if not pd.isna(status.mae_24h) else "n/a",
+                  help="Live MAE on predictions whose 30-min target has now arrived.")
+        d3.metric("MAE — last 7d",
+                  f"{status.mae_7d:.1f}" if not pd.isna(status.mae_7d) else "n/a")
+        if status.drift_ratio is not None:
+            d4.metric("Drift ratio (24h vs trained)",
+                      f"{status.drift_ratio:.2f}×",
+                      delta=("retrain recommended" if status.recommend_retrain else "stable"),
+                      delta_color="inverse")
+        else:
+            d4.metric("Drift ratio", "n/a")
+        if status.recommend_retrain:
+            st.warning(status.recommendation)
+        else:
+            st.caption(status.recommendation)
+
+        # Rolling MAE chart
+        rolled = drift.rolling_mae_series(PREDICTIONS_LOG, UNIFIED_PARQUET, window="6h")
+        if not rolled.empty:
+            fig2 = go.Figure()
+            fig2.add_trace(go.Scatter(
+                x=rolled["target_timestamp"], y=rolled["rolling_mae"],
+                name="Rolling 6h MAE", line=dict(color="#9467bd", width=1.5),
+            ))
+            if status.trained_mae:
+                fig2.add_hline(y=status.trained_mae, line=dict(color="green", dash="dash"),
+                               annotation_text="trained MAE", annotation_position="top right")
+                fig2.add_hline(y=status.trained_mae * 1.5, line=dict(color="orange", dash="dash"),
+                               annotation_text="1.5× threshold", annotation_position="bottom right")
+            fig2.update_layout(height=300, yaxis_title="MAE (mg/dL)", xaxis_title="UTC",
+                               legend=dict(orientation="h"))
+            st.plotly_chart(fig2, width="stretch")
+
+        with st.expander("Recent prediction log (last 50 rows)"):
+            st.dataframe(log.tail(50).iloc[::-1], width="stretch", hide_index=True)
+    else:
+        st.info("No predictions logged yet. Click **Refresh now** above to make the first one.")
+
+
 # ---------- Pipeline section -------------------------------------------------
 
-if section == "Pipeline":
+elif section == "Pipeline":
     st.title("Pipeline")
     st.caption("Run each phase independently. Outputs land in `data/processed/`.")
 
@@ -509,3 +642,96 @@ elif section == "Predict":
     overall_mae = backtest["abs_error"].mean()
     st.caption(f"Across all {len(backtest):,} rows: MAE = **{overall_mae:.2f} mg/dL** "
                "(includes training data — your test-set MAE on the Model tab is the honest one).")
+
+
+# ---------- What-if section --------------------------------------------------
+
+elif section == "What-if":
+    st.title("What-if (counterfactuals)")
+    st.markdown(
+        "Ask the model: **what would it predict if a different action had just been taken?** "
+        "We don't simulate the body — we mechanically modify the inputs (IOB, recent boluses, "
+        "basal rate) and re-run the forecaster. The result is the model's *belief* about an "
+        "action's effect, only as good as the patterns it has learned. "
+        "See `docs/ML_PRIMER.md` for the limits."
+    )
+
+    if not MODEL_PATH.exists() or not FEATURES_PARQUET.exists():
+        st.info("Need a trained model and a features table. Visit the **Model** tab first.")
+        st.stop()
+
+    feats = pd.read_parquet(FEATURES_PARQUET)
+    model, feature_cols = predict_mod.load_model(MODEL_DIR)
+    available = feats.dropna(subset=feature_cols)
+    if available.empty:
+        st.warning("No row has a complete feature vector yet — ingest more data.")
+        st.stop()
+
+    last_row = available.iloc[[-1]]
+    current_glucose = float(last_row["glucose_mg_dl"].iloc[0])
+    current_iob = float(last_row.get("iob_units", pd.Series([0])).iloc[0])
+    as_of = str(last_row["timestamp"].iloc[0])
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Current glucose", f"{current_glucose:.0f} mg/dL")
+    c2.metric("Current IOB", f"{current_iob:.2f} U")
+    c3.metric("As of (UTC)", as_of.split("+")[0].replace("T", " "))
+
+    st.subheader("Configure scenarios")
+    with st.container(border=True):
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.markdown("**Bolus doses to test (units)**")
+            bolus_doses = st.multiselect(
+                "Bolus units",
+                options=[0.5, 1.0, 1.5, 2.0, 3.0, 4.0],
+                default=[0.5, 1.0, 2.0, 3.0],
+                label_visibility="collapsed",
+            )
+        with col_b:
+            st.markdown("**Suspend durations to test (minutes)**")
+            suspend_durations = st.multiselect(
+                "Suspend min",
+                options=[15, 30, 45, 60, 90],
+                default=[30, 60],
+                label_visibility="collapsed",
+            )
+
+    actions = (
+        [counterfactual.Action("bolus", units=u) for u in bolus_doses]
+        + [counterfactual.Action("suspend", minutes=m) for m in suspend_durations]
+    )
+
+    if not actions:
+        st.info("Pick at least one action to compare.")
+        st.stop()
+
+    cf = counterfactual.simulate(model, feature_cols, last_row, actions)
+
+    st.subheader("Predicted glucose at +30 min — by scenario")
+    fig = go.Figure()
+    colors = ["#1f77b4"] + ["#ff7f0e"] * len(bolus_doses) + ["#2ca02c"] * len(suspend_durations)
+    fig.add_trace(go.Bar(
+        x=cf["scenario"], y=cf["prediction_30m"],
+        marker_color=colors[:len(cf)],
+        text=[f"{v:.0f}" for v in cf["prediction_30m"]],
+        textposition="outside",
+    ))
+    fig.add_hline(y=current_glucose, line=dict(color="gray", dash="dash"),
+                  annotation_text=f"current ({current_glucose:.0f})",
+                  annotation_position="top left")
+    fig.add_hrect(y0=70, y1=180, fillcolor="green", opacity=0.06, line_width=0)
+    fig.update_layout(height=420, yaxis_title="Predicted mg/dL at t+30m",
+                      xaxis_title="", showlegend=False)
+    st.plotly_chart(fig, width="stretch")
+
+    st.subheader("Effect vs. doing nothing")
+    cf_display = cf.copy()
+    cf_display["delta_vs_baseline"] = cf_display["delta_vs_baseline"].round(1)
+    cf_display["prediction_30m"] = cf_display["prediction_30m"].round(1)
+    st.dataframe(cf_display, width="stretch", hide_index=True)
+    st.caption(
+        "Negative `delta_vs_baseline` means the action is predicted to bring glucose "
+        "*lower* than no action would. Suspends only show small effects on the 30-min "
+        "horizon because suspend's downstream impact is mostly > 30 min out."
+    )

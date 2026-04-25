@@ -10,6 +10,11 @@ xgboost>=2.0
 shap>=0.45
 requests>=2.32
 
+# Live Dexcom Share polling (~5 min latency). Optional — refresh.py
+# falls back to synthetic data if creds aren't set or the package
+# isn't importable.
+pydexcom>=0.4
+
 # tconnectsync — reverse-engineered Tandem t:connect API client.
 # Pinned to GitHub because PyPI release cadence lags upstream auth fixes.
 tconnectsync @ git+https://github.com/jwoglom/tconnectsync@main

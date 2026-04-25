@@ -9,27 +9,34 @@ This repo covers **data only** — no model training yet.
 ## Layout
 
 ```
-app.py                 # Streamlit UI (Pipeline / Timeline / Stats / Model / Predict)
+app.py                  # Streamlit UI (Live / Pipeline / Timeline / Stats /
+                        #               Model / Predict / What-if)
 docs/
-  ML_PRIMER.md         # Plain-English explainer for non-ML readers
+  ML_PRIMER.md          # Plain-English explainer for non-ML readers
 src/
-  ingest_dexcom.py     # Phase 1 — Clarity CSV -> dexcom_clean.parquet
-  ingest_tandem.py     # Phase 2 — tconnectsync -> tandem_clean.parquet
-                       #           (synthetic fallback if API breaks)
-  merge_pipeline.py    # Phase 3 — 5-min unified timeline
-  validate_pipeline.py # Phase 4 — EDA, gap detection, time-in-range
-  features.py          # Phase 5 — lag/rolling/time features + 30m label
-  train.py             # Phase 6 — walk-forward split + XGBoost
-  predict.py           # Phase 7 — inference (latest + backtest)
-  explain.py           # Phase 8 — SHAP global + local explanations
+  ingest_dexcom.py      # Phase 1  — Clarity CSV -> dexcom_clean.parquet (bulk)
+  ingest_tandem.py      # Phase 2  — tconnectsync -> tandem_clean.parquet
+                        #            (synthetic fallback if API breaks)
+  merge_pipeline.py     # Phase 3  — 5-min unified timeline
+  validate_pipeline.py  # Phase 4  — EDA, gap detection, time-in-range
+  features.py           # Phase 5  — lag/rolling/time features + 30m label
+  train.py              # Phase 6  — walk-forward split + XGBoost
+  predict.py            # Phase 7  — inference (latest + backtest)
+  explain.py            # Phase 8  — SHAP global + local explanations
+  ingest_dexcom_share.py# Phase 9  — pydexcom live CGM (~5 min latency)
+  refresh.py            # Phase 10 — orchestrator (one-shot or --loop)
+  anomaly.py            # Phase 11 — threshold-based alerts on live forecasts
+  drift.py              # Phase 12 — rolling MAE/RMSE on logged predictions
+  counterfactual.py     # Phase 13 — "what if" simulator over the model
 scripts/
-  _smoke_test.py       # Data-pipeline canary (Phases 1-4)
-  _smoke_ml.py         # ML-pipeline canary (Phases 5-8)
+  _smoke_test.py        # Data-pipeline canary  (Phases 1-4)
+  _smoke_ml.py          # ML-pipeline canary    (Phases 5-8)
+  _smoke_live.py        # Live-pipeline canary  (Phases 9-13)
 data/
-  raw/                 # untracked: drop Clarity CSV exports here
-  processed/           # untracked: parquet outputs land here
-  models/              # untracked: saved model + metrics + SHAP
-plots/                 # untracked: validation plots
+  raw/                  # untracked: drop Clarity CSV exports here
+  processed/            # untracked: parquet outputs + live logs
+  models/               # untracked: saved model + metrics + SHAP
+plots/                  # untracked: validation plots
 ```
 
 ## Setup
@@ -208,6 +215,63 @@ parquet for gaps, sensor noise, or unlogged meals.
 ## ML smoke test
 ```bash
 python scripts/_smoke_ml.py    # synthesizes 60 days, runs phases 5-8 end-to-end
+```
+
+## Live pipeline (Phases 9-13)
+
+Backfill (Phases 1-4) gave us the historical timeline; the **live pipeline**
+keeps it fresh and turns predictions into actionable alerts.
+
+| Phase | Module | What it does |
+|-------|--------|--------------|
+| 9  | `ingest_dexcom_share.py` | Polls Dexcom Share for the latest CGM (~5 min latency). Falls back to synthetic. |
+| 10 | `refresh.py`             | One refresh cycle: pull → re-merge → re-feature → predict → log → alert. `--loop` runs forever. |
+| 11 | `anomaly.py`             | Hand-tuned thresholds on the latest forecast: predicted low/high/drop/rise/stale-data. |
+| 12 | `drift.py`               | Rolling MAE/RMSE on logged predictions vs the actual glucose 30 min later. Flags "retrain needed" when live MAE exceeds 1.5× the trained-test MAE. |
+| 13 | `counterfactual.py`      | "What if" simulator — re-runs the model with hypothetical bolus/suspend actions and reports the predicted delta. |
+
+### Run a single refresh
+
+```bash
+python -m src.refresh -v
+```
+
+Output:
+```
+Merged 12 new readings (source=pydexcom); dexcom_clean now has 8640 rows up to 2026-04-25 16:25:00+00:00
+as_of=2026-04-25 16:25:00+00:00  current=142  predict_30m=156  Δ=+14  alerts: info:predicted_rise
+```
+
+### Run continuously (Docker scheduler sidecar handles this)
+
+```bash
+python -m src.refresh --loop --interval 300
+```
+
+### What lands on disk per cycle
+- `data/processed/dexcom_clean.parquet`  — appended with new readings, deduped on timestamp.
+- `data/processed/unified_timeline.parquet`  — re-merged.
+- `data/processed/features.parquet`  — re-engineered.
+- `data/processed/predictions_log.parquet`  — append-only `(predicted_at, target_timestamp, current_glucose, prediction_30m)`. This is what `drift.py` reads to compute live accuracy.
+- `data/processed/alerts_log.parquet`  — last 1,000 alerts.
+
+### Live tab in the UI
+- Current glucose + 30-min forecast tile with delta.
+- Active alerts banner (color-coded by severity).
+- Last-24h chart of predictions overlaid with realized glucose.
+- Drift summary: live 24h/7d MAE vs trained MAE, with a 1.5× threshold line drawn on the rolling-MAE chart.
+- Auto-refresh selector (1/5/10 min) — uses an HTML meta-refresh so it works without WebSocket sessions.
+
+### What-if tab
+Pick a set of hypothetical bolus doses and basal-suspend durations; the
+model re-predicts the 30-min glucose for each scenario and you see a
+side-by-side bar chart + delta-vs-baseline table. This is the
+counterfactual feature — see `docs/ML_PRIMER.md` and the
+`counterfactual.py` docstring for what it can and can't tell you.
+
+### Live smoke test
+```bash
+python scripts/_smoke_live.py  # bootstraps with ML smoke, runs 9-13 end-to-end
 ```
 
 ## Deploying on Unraid (Docker)
