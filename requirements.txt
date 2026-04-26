@@ -17,4 +17,5 @@ pydexcom>=0.4
 
 # tconnectsync — reverse-engineered Tandem t:connect API client.
 # Pinned to GitHub because PyPI release cadence lags upstream auth fixes.
-tconnectsync @ git+https://github.com/jwoglom/tconnectsync@main
+# No branch specifier — let pip use whatever the upstream default branch is.
+tconnectsync @ git+https://github.com/jwoglom/tconnectsync
