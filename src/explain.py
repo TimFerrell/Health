@@ -41,13 +41,24 @@ def _shap_values(model, X: pd.DataFrame) -> np.ndarray:
     XGBoost ships TreeSHAP — exact, fast, no external `shap` package
     required. Each row in the returned array is one SHAP value per
     feature plus a final "bias" term.
+
+    Returns a 2-D array of shape (n_rows, n_features + 1). Some
+    XGBoost versions return 1-D for n_rows == 1; we always reshape to
+    2-D so callers don't need to special-case it.
     """
     booster = model.get_booster()
-    dmat = booster.DMatrix if hasattr(booster, "DMatrix") else None  # noqa: F841
     import xgboost as xgb  # local import keeps top of file lean
 
     dm = xgb.DMatrix(X)
-    return booster.predict(dm, pred_contribs=True)
+    contribs = np.asarray(booster.predict(dm, pred_contribs=True))
+    if contribs.ndim == 1:
+        # xgboost 2.x with single-row input returns (n_features+1,).
+        contribs = contribs.reshape(1, -1)
+    elif contribs.ndim == 3:
+        # Multi-class classifier path: (n_rows, n_classes, n_features+1).
+        # Not our case (regression), but defensive.
+        contribs = contribs.reshape(contribs.shape[0], -1)
+    return contribs
 
 
 def global_importance(model, X: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
@@ -72,9 +83,9 @@ def local_explanation(model, X_row: pd.DataFrame, feature_cols: list[str], top_k
     Returns the baseline, the prediction, and the top-k features by
     absolute contribution (positive and negative both included).
     """
-    contribs = _shap_values(model, X_row)[0]
-    feat_contribs = contribs[:-1]
-    bias = float(contribs[-1])
+    contribs = _shap_values(model, X_row)  # always (n_rows, n_features + 1)
+    feat_contribs = contribs[0, :-1]
+    bias = float(contribs[0, -1])
     pairs = sorted(zip(feature_cols, feat_contribs), key=lambda kv: abs(kv[1]), reverse=True)[:top_k]
     return {
         "baseline": bias,
