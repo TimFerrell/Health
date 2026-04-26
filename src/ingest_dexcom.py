@@ -105,10 +105,25 @@ def clean_dexcom(df: pd.DataFrame) -> pd.DataFrame:
     ts_col = _find_column(df, "timestamp_yyyy-mm-ddthh:mm:ss", "timestamp", "device_timestamp")
     glucose_col = _find_column(df, "glucose_value_mg_dl", "glucose_value_mmol_l", "glucose_value")
     trend_col = None
-    for candidate in ("trend_arrow", "rate_of_change_mg_dl_min"):
+    # Older Clarity exports include a "Trend Arrow" column; current
+    # exports use "Glucose Rate of Change (mg/dL/min)". Match either.
+    # The fuzzy fallback catches column-name drift from future Clarity
+    # versions without us having to redeploy.
+    for candidate in ("trend_arrow", "rate_of_change_mg_dl_min", "glucose_rate_of_change_mg_dl_min"):
         if candidate in df.columns:
             trend_col = candidate
             break
+    if trend_col is None:
+        for c in df.columns:
+            if "trend" in c or "rate_of_change" in c:
+                trend_col = c
+                break
+    if trend_col is None:
+        logger.warning(
+            "No trend / rate-of-change column found in Clarity export; "
+            "trend_arrow_encoded will be NaN. Available columns: %s",
+            list(df.columns),
+        )
 
     egv_mask = df[event_col].str.upper().eq("EGV")
     egv = df.loc[egv_mask, [ts_col, glucose_col] + ([trend_col] if trend_col else [])].copy()
@@ -131,9 +146,11 @@ def clean_dexcom(df: pd.DataFrame) -> pd.DataFrame:
     )
     if trend_col == "trend_arrow":
         out["trend_arrow_encoded"] = egv[trend_col].map(_encode_trend)
-    elif trend_col == "rate_of_change_mg_dl_min":
+    elif trend_col and "rate_of_change" in trend_col:
         # Convert numeric rate-of-change (mg/dL/min) to the same -2..+2
         # scale so downstream code only sees one trend representation.
+        # Matches both "rate_of_change_mg_dl_min" (older) and
+        # "glucose_rate_of_change_mg_dl_min" (current Clarity exports).
         roc = pd.to_numeric(egv[trend_col], errors="coerce")
         out["trend_arrow_encoded"] = roc.clip(-2, 2).round().astype("Int8").astype("float")
     else:
