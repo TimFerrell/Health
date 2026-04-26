@@ -78,10 +78,50 @@ def _load_parquet(path: str, mtime: float) -> pd.DataFrame:
     return pd.read_parquet(path)
 
 
-def _load_unified() -> pd.DataFrame | None:
-    if not UNIFIED_PARQUET.exists():
+def _load(path: Path) -> pd.DataFrame | None:
+    """Cached load for any of our parquets. Returns None if missing."""
+    if not path.exists():
         return None
-    return _load_parquet(str(UNIFIED_PARQUET), UNIFIED_PARQUET.stat().st_mtime)
+    return _load_parquet(str(path), path.stat().st_mtime)
+
+
+def _load_unified() -> pd.DataFrame | None:
+    return _load(UNIFIED_PARQUET)
+
+
+@st.cache_resource(show_spinner=False)
+def _cached_model(model_dir: str, mtime: float):
+    """Cache the deserialized XGBoost booster across reruns. The mtime
+    key invalidates when you retrain."""
+    del mtime
+    return predict_mod.load_model(Path(model_dir))
+
+
+def _load_model():
+    if not MODEL_PATH.exists():
+        return None, None
+    return _cached_model(str(MODEL_DIR), MODEL_PATH.stat().st_mtime)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_backtest(features_path: str, model_dir: str, feats_mtime: float, model_mtime: float) -> pd.DataFrame:
+    """The backtest is deterministic in (features, model) — cache on
+    their mtimes. ~25k row predict() is fast (~50 ms) but the
+    DataFrame copy that follows is what stalls Streamlit reruns."""
+    del feats_mtime, model_mtime
+    feats = pd.read_parquet(features_path)
+    model, cols = predict_mod.load_model(Path(model_dir))
+    return predict_mod.predict_dataframe(model, cols, feats)
+
+
+def _decimate(df: pd.DataFrame, n: int = 2000) -> pd.DataFrame:
+    """Even-stride downsample for plotting. The eye can't resolve more
+    than ~2,000 points in a glucose chart, and plotly + iOS Safari
+    chokes on full 25k-point series."""
+    if len(df) <= n:
+        return df
+    step = max(1, len(df) // n)
+    return df.iloc[::step]
 
 
 # ---------- sidebar ----------------------------------------------------------
@@ -120,7 +160,7 @@ if section == "Live":
                             help="Pulls the last 24 h of CGM, re-merges, re-features, predicts.")
     with col_b:
         auto_refresh_min = st.selectbox("Auto-refresh", [0, 1, 5, 10], index=0,
-                                         help="Set 0 to disable. Server-side rerun in the background.")
+                                         help="Set 0 to disable. Re-runs only the live tile, not the whole app.")
     with col_c:
         if not MODEL_PATH.exists():
             st.warning("No trained model yet — go to **Model** and train first.")
@@ -133,24 +173,24 @@ if section == "Live":
             except Exception as e:  # noqa: BLE001
                 st.error(f"Refresh failed: {e}")
 
-    # Auto-refresh: fragment-style rerun. Streamlit fires this every N min.
-    if auto_refresh_min:
-        st.caption(f"Auto-refreshing every {auto_refresh_min} min.")
-        st.markdown(
-            f"<meta http-equiv='refresh' content='{auto_refresh_min * 60}'>",
-            unsafe_allow_html=True,
-        )
+    # --- The live tile lives in a fragment so its `run_every` rerun
+    # only re-renders this block, not the whole script (no parquet
+    # reloads, no heavy imports). ----------------------------------------
+    fragment_interval = f"{auto_refresh_min}min" if auto_refresh_min else None
 
-    # --- Latest prediction --------------------------------------------------
-    if PREDICTIONS_LOG.exists():
-        log = pd.read_parquet(PREDICTIONS_LOG).sort_values("predicted_at")
+    @st.fragment(run_every=fragment_interval)
+    def _live_panel():
+        if not PREDICTIONS_LOG.exists():
+            st.info("No predictions logged yet. Click **Refresh now** above to make the first one.")
+            return
+
+        log = _load(PREDICTIONS_LOG).sort_values("predicted_at")
         latest = log.iloc[-1]
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Current", f"{latest['current_glucose']:.0f} mg/dL")
         delta = latest["prediction_30m"] - latest["current_glucose"]
         c2.metric("Predicted (+30m)", f"{latest['prediction_30m']:.0f} mg/dL", delta=f"{delta:+.0f}")
         c3.metric("As of (UTC)", str(latest["predicted_at"]).split("+")[0].replace("T", " "))
-        # Live alerts (recompute against latest row to reflect any threshold tweaks).
         alerts = anomaly.detect(
             current_glucose=float(latest["current_glucose"]),
             current_timestamp=latest["predicted_at"],
@@ -171,8 +211,9 @@ if section == "Live":
 
         # --- Recent predictions chart ---------------------------------------
         st.subheader("Recent predictions vs. realized glucose")
-        scored = drift.join_with_actuals(log, _load_unified() if UNIFIED_PARQUET.exists() else pd.DataFrame())
-        recent = scored.tail(288)  # last 24h at 5-min cadence
+        unified = _load_unified() if UNIFIED_PARQUET.exists() else pd.DataFrame()
+        scored = drift.join_with_actuals(log, unified)
+        recent = _decimate(scored.tail(288))  # last 24h at 5-min cadence -> already 288 max
         fig = go.Figure()
         fig.add_hrect(y0=70, y1=180, fillcolor="green", opacity=0.06, line_width=0)
         fig.add_trace(go.Scatter(
@@ -209,9 +250,9 @@ if section == "Live":
         else:
             st.caption(status.recommendation)
 
-        # Rolling MAE chart
         rolled = drift.rolling_mae_series(PREDICTIONS_LOG, UNIFIED_PARQUET, window="6h")
         if not rolled.empty:
+            rolled = _decimate(rolled)
             fig2 = go.Figure()
             fig2.add_trace(go.Scatter(
                 x=rolled["target_timestamp"], y=rolled["rolling_mae"],
@@ -228,8 +269,8 @@ if section == "Live":
 
         with st.expander("Recent prediction log (last 50 rows)"):
             st.dataframe(log.tail(50).iloc[::-1], width="stretch", hide_index=True)
-    else:
-        st.info("No predictions logged yet. Click **Refresh now** above to make the first one.")
+
+    _live_panel()
 
 
 # ---------- Log carbs section ------------------------------------------------
@@ -297,7 +338,7 @@ elif section == "Log carbs":
 
         # Coverage stats vs pump-derived carbs
         if TANDEM_PARQUET.exists():
-            tandem = pd.read_parquet(TANDEM_PARQUET)
+            tandem = _load(TANDEM_PARQUET)
             derived = treatments_mod.derive_from_tandem(tandem)
             unioned = treatments_mod.union(derived, treatments_mod.load(TREATMENTS_PARQUET))
             counts = unioned["source"].value_counts()
@@ -406,11 +447,16 @@ elif section == "Timeline":
         st.warning("No rows in selected window.")
         st.stop()
 
+    # Decimate the line series before handing to plotly. Boluses /
+    # suspends are sparse markers — leave those un-decimated so we
+    # don't drop events.
+    view_line = _decimate(view, 2000)
+
     # --- Glucose + bolus chart -------------------------------------------
     fig = go.Figure()
     fig.add_hrect(y0=70, y1=180, fillcolor="green", opacity=0.08, line_width=0)
     fig.add_trace(go.Scatter(
-        x=view["timestamp"], y=view["glucose_mg_dl"],
+        x=view_line["timestamp"], y=view_line["glucose_mg_dl"],
         mode="lines", name="Glucose", line=dict(width=1.4, color="#1f77b4"),
     ))
     boluses = view[view["bolus_units"].fillna(0) > 0]
@@ -440,11 +486,11 @@ elif section == "Timeline":
     # --- IOB overlay -----------------------------------------------------
     fig2 = go.Figure()
     fig2.add_trace(go.Scatter(
-        x=view["timestamp"], y=view["glucose_mg_dl"],
+        x=view_line["timestamp"], y=view_line["glucose_mg_dl"],
         mode="lines", name="Glucose", yaxis="y", line=dict(color="#1f77b4", width=1.0),
     ))
     fig2.add_trace(go.Scatter(
-        x=view["timestamp"], y=view["iob_units"],
+        x=view_line["timestamp"], y=view_line["iob_units"],
         mode="lines", name="IOB", yaxis="y2", line=dict(color="#ff7f0e", width=1.2),
         fill="tozeroy", fillcolor="rgba(255,127,14,0.15)",
     ))
@@ -629,10 +675,10 @@ elif section == "Model":
                     st.error(f"SHAP failed: {e}")
 
     if IMPORTANCE_PATH.exists():
-        importance = pd.read_parquet(IMPORTANCE_PATH).head(20)
-        st.bar_chart(importance.set_index("feature")["mean_abs_shap"], height=420)
+        importance_full = _load(IMPORTANCE_PATH)
+        st.bar_chart(importance_full.head(20).set_index("feature")["mean_abs_shap"], height=420)
         with st.expander("Full importance table"):
-            st.dataframe(pd.read_parquet(IMPORTANCE_PATH), width="stretch", hide_index=True)
+            st.dataframe(importance_full, width="stretch", hide_index=True)
 
 
 # ---------- Predict section --------------------------------------------------
@@ -648,12 +694,12 @@ elif section == "Predict":
         st.info("Build features and train the model on the **Model** tab first.")
         st.stop()
 
-    feats = pd.read_parquet(FEATURES_PARQUET)
+    feats = _load(FEATURES_PARQUET)
 
     # --- Live forecast --------------------------------------------------
     st.subheader("Latest forecast")
     try:
-        model, feature_cols = predict_mod.load_model(MODEL_DIR)
+        model, feature_cols = _load_model()
         latest = predict_mod.predict_latest(model, feature_cols, feats)
     except Exception as e:  # noqa: BLE001
         st.error(f"Prediction failed: {e}")
@@ -689,14 +735,14 @@ elif section == "Predict":
         "test window is the rightmost ~15% of the timeline; that's the slice that "
         "honestly measures generalization."
     )
-    backtest = predict_mod.predict_dataframe(model, feature_cols, feats)
+    backtest = _cached_backtest(
+        str(FEATURES_PARQUET), str(MODEL_DIR),
+        FEATURES_PARQUET.stat().st_mtime, MODEL_PATH.stat().st_mtime,
+    )
     backtest = backtest.dropna(subset=["actual_30m"])
-
-    if len(backtest) > 5000:
-        backtest_view = backtest.tail(2000)
-        st.caption("Showing last 2,000 rows for readability.")
-    else:
-        backtest_view = backtest
+    backtest_view = _decimate(backtest, 2000)
+    if len(backtest) > len(backtest_view):
+        st.caption(f"Decimated to {len(backtest_view):,} of {len(backtest):,} rows for the chart.")
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
@@ -735,8 +781,8 @@ elif section == "What-if":
         st.info("Need a trained model and a features table. Visit the **Model** tab first.")
         st.stop()
 
-    feats = pd.read_parquet(FEATURES_PARQUET)
-    model, feature_cols = predict_mod.load_model(MODEL_DIR)
+    feats = _load(FEATURES_PARQUET)
+    model, feature_cols = _load_model()
     available = feats.dropna(subset=feature_cols)
     if available.empty:
         st.warning("No row has a complete feature vector yet — ingest more data.")
