@@ -39,25 +39,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Run as a non-root UID. Unraid's default "nobody" user is 99:100;
 # we use the same so bind-mounted /data has expected ownership.
+# Note: GID 100 already exists in debian:slim as "users", so we skip
+# group creation if the GID is taken and just attach our user to it.
 ARG PUID=99
 ARG PGID=100
-RUN groupadd -g ${PGID} app || true \
+RUN if ! getent group ${PGID} >/dev/null; then groupadd -g ${PGID} app; fi \
  && useradd -u ${PUID} -g ${PGID} -m -s /bin/bash app
 
 COPY --from=builder /install /usr/local
 
 WORKDIR /app
-COPY --chown=app:app app.py ./
-COPY --chown=app:app src ./src
-COPY --chown=app:app docs ./docs
-COPY --chown=app:app scripts ./scripts
+# Numeric IDs in --chown so we don't depend on the group's *name*
+# (which is "users" when GID 100 already exists, "app" otherwise).
+COPY --chown=99:100 app.py ./
+COPY --chown=99:100 src ./src
+COPY --chown=99:100 docs ./docs
+COPY --chown=99:100 scripts ./scripts
 
 # Persistent volume for raw exports, processed parquets, and the
 # trained model. Bind-mount this on Unraid (e.g. to
 # /mnt/user/appdata/t1d-pipeline) so re-running the container doesn't
 # wipe your work.
 RUN mkdir -p /data/raw /data/processed /data/models /data/plots \
- && chown -R app:app /data /app
+ && chown -R ${PUID}:${PGID} /data /app
 
 USER app
 
