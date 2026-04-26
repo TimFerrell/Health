@@ -44,14 +44,15 @@ logger = logging.getLogger(__name__)
 IOB_TAU_MIN = 240.0
 
 
-ActionKind = Literal["bolus", "suspend"]
+ActionKind = Literal["bolus", "suspend", "carbs"]
 
 
 @dataclass
 class Action:
     kind: ActionKind
-    units: float = 0.0       # for bolus
-    minutes: float = 0.0     # for suspend
+    units: float = 0.0       # bolus: insulin units
+    minutes: float = 0.0     # suspend: duration
+    grams: float = 0.0       # carbs: grams ingested
 
 
 def _decay_factor(elapsed_min: float, tau_min: float = IOB_TAU_MIN) -> float:
@@ -95,6 +96,21 @@ def apply_action(row: pd.DataFrame, action: Action) -> pd.DataFrame:
         # too short to see most of a suspend's downstream effect on
         # glucose; document this in the UI.
 
+    elif action.kind == "carbs" and action.grams > 0:
+        # Pretend N grams of carbs just landed. Bump every
+        # `carbs_sum_Nm` rolling window (the carbs are inside all of
+        # them) and reset minutes_since_carbs.
+        for col in cols:
+            if col.startswith("carbs_sum_"):
+                new.loc[:, col] = new[col].astype("float32") + float(action.grams)
+        if "minutes_since_carbs" in cols:
+            new.loc[:, "minutes_since_carbs"] = 0.0
+        # NOTE: this only matters if the model was trained WITH carb
+        # features. A pre-carb-features model has no carbs_sum_* columns
+        # in its feature_columns.json, so this branch is a no-op for it.
+        # Retrain on data that includes the new features to make
+        # carb-action counterfactuals informative.
+
     return new
 
 
@@ -132,6 +148,8 @@ def simulate(
             label = f"bolus +{action.units:g}U now"
         elif action.kind == "suspend":
             label = f"suspend basal for {action.minutes:g} min"
+        elif action.kind == "carbs":
+            label = f"eat {action.grams:g}g carbs now"
         else:  # pragma: no cover
             label = action.kind
         rows.append({
@@ -152,4 +170,7 @@ def standard_action_grid() -> list[Action]:
         Action("bolus", units=3.0),
         Action("suspend", minutes=30),
         Action("suspend", minutes=60),
+        Action("carbs", grams=8),    # standard juice-box low treatment
+        Action("carbs", grams=15),   # standard low treatment
+        Action("carbs", grams=30),   # full meal
     ]

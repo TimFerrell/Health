@@ -78,8 +78,15 @@ def fetch_via_tconnectsync(cfg: TandemConfig) -> pd.DataFrame:
     # map to our four canonical event types and concatenate them.
     rows: list[dict] = []
 
-    # Bolus events (carb + correction)
+    # Bolus events (carb + correction). t:connect's BolusRequestDTO
+    # carries the carbs the user entered into the calculator and the
+    # split between food / correction insulin. Field names vary slightly
+    # by tconnectsync version, so we probe a handful of candidates.
     for b in api.controliq.dailybolusdata(cfg.start, cfg.end):
+        carbs_g = b.get("carbsRequest") or b.get("carbsAmount") or b.get("carbs") or b.get("carbAmount")
+        bg = b.get("bgValue") or b.get("bg") or b.get("targetBG")
+        food_u = b.get("foodInsulin") or b.get("foodInsulinDelivered")
+        corr_u = b.get("correctionInsulin") or b.get("correctionInsulinDelivered")
         rows.append(
             {
                 "timestamp": _to_utc(b.get("eventDateTime") or b.get("requestDateTime")),
@@ -87,6 +94,12 @@ def fetch_via_tconnectsync(cfg: TandemConfig) -> pd.DataFrame:
                 "value": float(b.get("insulinDelivered") or b.get("requestedInsulin") or 0.0),
                 "duration_minutes": float(b.get("duration") or 0.0) / 60.0 if b.get("duration") else 0.0,
                 "iob_units": float(b.get("iob")) if b.get("iob") is not None else float("nan"),
+                # New optional carb-context fields. NaN when the bolus
+                # was a manual override or the calculator wasn't used.
+                "carbs_g": float(carbs_g) if carbs_g is not None else float("nan"),
+                "bg_at_bolus": float(bg) if bg is not None else float("nan"),
+                "food_insulin": float(food_u) if food_u is not None else float("nan"),
+                "correction_insulin": float(corr_u) if corr_u is not None else float("nan"),
             }
         )
 
@@ -156,12 +169,16 @@ def synthesize_tandem(cfg: TandemConfig, seed: int = 42) -> pd.DataFrame:
                 }
             )
 
-        # Three meal boluses with realistic dosing for a child (~0.5-3 U)
+        # Three meal boluses with realistic dosing for a child (~0.5-3 U).
+        # We back-compute carbs from the dose using a child-typical ICR
+        # (insulin-to-carb ratio) of 12 g per U, with some jitter.
         for meal_hour, mean_dose in ((7.5, 2.5), (12.0, 2.0), (18.0, 3.0)):
             t = day + timedelta(hours=meal_hour) + timedelta(minutes=int(rng.uniform(-20, 20)))
             if t < cfg.start or t > cfg.end:
                 continue
             dose = max(0.1, round(rng.normal(mean_dose, 0.5), 2))
+            icr = max(8.0, rng.normal(12.0, 1.5))
+            carbs = round(dose * icr, 1)
             rows.append(
                 {
                     "timestamp": _to_utc(t),
@@ -171,6 +188,10 @@ def synthesize_tandem(cfg: TandemConfig, seed: int = 42) -> pd.DataFrame:
                     # Synthetic IOB starts at the dose itself; merge layer
                     # applies decay if the raw value isn't trusted.
                     "iob_units": dose,
+                    "carbs_g": carbs,
+                    "bg_at_bolus": float(round(rng.normal(140, 25))),
+                    "food_insulin": dose * 0.85,
+                    "correction_insulin": dose * 0.15,
                 }
             )
 
@@ -209,16 +230,24 @@ def synthesize_tandem(cfg: TandemConfig, seed: int = 42) -> pd.DataFrame:
 
 
 def normalize(df: pd.DataFrame) -> pd.DataFrame:
-    """Coerce columns into the canonical schema and types."""
+    """Coerce columns into the canonical schema and types.
+
+    Carb-context columns are optional and only meaningful on bolus
+    rows; we fill NaN for everything else. Backward-compatible with
+    parquets written before these columns existed.
+    """
     required = ["timestamp", "event_type", "value", "duration_minutes", "iob_units"]
+    optional_floats = ["carbs_g", "bg_at_bolus", "food_insulin", "correction_insulin"]
     for col in required:
         if col not in df.columns:
             df[col] = float("nan") if col != "event_type" else ""
-    df = df[required].copy()
+    for col in optional_floats:
+        if col not in df.columns:
+            df[col] = float("nan")
+    df = df[required + optional_floats].copy()
     df["event_type"] = df["event_type"].astype("category")
-    df["value"] = pd.to_numeric(df["value"], errors="coerce").astype("float32")
-    df["duration_minutes"] = pd.to_numeric(df["duration_minutes"], errors="coerce").astype("float32")
-    df["iob_units"] = pd.to_numeric(df["iob_units"], errors="coerce").astype("float32")
+    for col in ["value", "duration_minutes", "iob_units", *optional_floats]:
+        df[col] = pd.to_numeric(df[col], errors="coerce").astype("float32")
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
     df = df.sort_values("timestamp").reset_index(drop=True)
     return df

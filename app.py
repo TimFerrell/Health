@@ -39,6 +39,7 @@ from src import (  # noqa: E402
     predict as predict_mod,
     refresh as refresh_mod,
     train as train_mod,
+    treatments as treatments_mod,
     validate_pipeline,
 )
 
@@ -49,6 +50,7 @@ DEXCOM_PARQUET = DATA_DIR / "dexcom_clean.parquet"
 TANDEM_PARQUET = DATA_DIR / "tandem_clean.parquet"
 UNIFIED_PARQUET = DATA_DIR / "unified_timeline.parquet"
 FEATURES_PARQUET = DATA_DIR / "features.parquet"
+TREATMENTS_PARQUET = DATA_DIR / "treatments.parquet"
 MODEL_PATH = MODEL_DIR / "xgb_glucose_30m.json"
 METRICS_PATH = MODEL_DIR / "metrics.json"
 IMPORTANCE_PATH = MODEL_DIR / "feature_importance.parquet"
@@ -87,7 +89,7 @@ def _load_unified() -> pd.DataFrame | None:
 st.sidebar.title("🩸 T1D Pipeline")
 section = st.sidebar.radio(
     "Section",
-    ["Live", "Pipeline", "Timeline", "Stats", "Model", "Predict", "What-if"],
+    ["Live", "Log carbs", "Pipeline", "Timeline", "Stats", "Model", "Predict", "What-if"],
     label_visibility="collapsed",
 )
 
@@ -228,6 +230,79 @@ if section == "Live":
             st.dataframe(log.tail(50).iloc[::-1], width="stretch", hide_index=True)
     else:
         st.info("No predictions logged yet. Click **Refresh now** above to make the first one.")
+
+
+# ---------- Log carbs section ------------------------------------------------
+
+elif section == "Log carbs":
+    st.title("Log carbs")
+    st.caption(
+        "Log meals, snacks, and low treatments. Bolused meals are pulled "
+        "automatically from the pump — this form is for **carbs that the pump "
+        "didn't see** (juice for a low, unbolused snacks). Stored append-only "
+        "to `treatments.parquet`."
+    )
+
+    # --- Quick low-treatment buttons ---------------------------------------
+    st.subheader("Quick low treatment")
+    st.caption("One tap for the most common kid-sized low treatments. Logs immediately "
+               "with the current time.")
+    cols = st.columns(len(treatments_mod.LOW_TREATMENT_PRESETS))
+    for col, preset in zip(cols, treatments_mod.LOW_TREATMENT_PRESETS):
+        if col.button(preset["label"], width="stretch", key=f"low_{preset['carbs_g']}"):
+            treatments_mod.append(
+                TREATMENTS_PARQUET,
+                kind="low_treatment",
+                carbs_g=preset["carbs_g"],
+                notes=preset["notes"],
+            )
+            st.success(f"Logged {preset['carbs_g']} g low treatment.")
+            st.rerun()
+
+    # --- Free-form log -----------------------------------------------------
+    st.subheader("Log a meal or snack")
+    with st.form("log_treatment", clear_on_submit=True):
+        c1, c2, c3 = st.columns([1, 1, 2])
+        kind = c1.selectbox("Kind", ["meal", "snack", "correction", "low_treatment", "other"], index=0)
+        carbs_g = c2.number_input("Carbs (g)", min_value=0.0, max_value=300.0, value=15.0, step=1.0)
+        notes = c3.text_input("Notes (optional)")
+        c4, c5 = st.columns(2)
+        use_now = c4.checkbox("Now", value=True, help="Uncheck to set a past time.")
+        ts_input = c5.text_input(
+            "Time (UTC, ISO 8601)",
+            value="",
+            disabled=use_now,
+            help="e.g. 2026-04-25T14:30:00",
+        )
+        submitted = st.form_submit_button("Log", type="primary")
+        if submitted:
+            if carbs_g <= 0:
+                st.error("Carbs must be greater than zero.")
+            else:
+                ts = None if use_now else ts_input
+                try:
+                    treatments_mod.append(TREATMENTS_PARQUET, timestamp=ts, kind=kind,
+                                          carbs_g=carbs_g, notes=notes)
+                    st.success(f"Logged {carbs_g:g} g ({kind}).")
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"Log failed: {e}")
+
+    # --- Recent log --------------------------------------------------------
+    st.subheader("Recent treatments")
+    recent = treatments_mod.load(TREATMENTS_PARQUET).tail(50).iloc[::-1]
+    if recent.empty:
+        st.info("No manual treatments logged yet.")
+    else:
+        st.dataframe(recent, width="stretch", hide_index=True)
+
+        # Coverage stats vs pump-derived carbs
+        if TANDEM_PARQUET.exists():
+            tandem = pd.read_parquet(TANDEM_PARQUET)
+            derived = treatments_mod.derive_from_tandem(tandem)
+            unioned = treatments_mod.union(derived, treatments_mod.load(TREATMENTS_PARQUET))
+            counts = unioned["source"].value_counts()
+            st.caption("Sources currently feeding the carbs feature: "
+                       + " · ".join(f"**{src}**: {n:,}" for src, n in counts.items()))
 
 
 # ---------- Pipeline section -------------------------------------------------
@@ -679,7 +754,7 @@ elif section == "What-if":
 
     st.subheader("Configure scenarios")
     with st.container(border=True):
-        col_a, col_b = st.columns(2)
+        col_a, col_b, col_c = st.columns(3)
         with col_a:
             st.markdown("**Bolus doses to test (units)**")
             bolus_doses = st.multiselect(
@@ -689,6 +764,15 @@ elif section == "What-if":
                 label_visibility="collapsed",
             )
         with col_b:
+            st.markdown("**Carbs to test (grams)**")
+            carb_amounts = st.multiselect(
+                "Carbs g",
+                options=[4, 8, 15, 20, 30, 45, 60],
+                default=[8, 15, 30],
+                label_visibility="collapsed",
+                help="Useful for low-treatment 'what if I give 8g now' planning.",
+            )
+        with col_c:
             st.markdown("**Suspend durations to test (minutes)**")
             suspend_durations = st.multiselect(
                 "Suspend min",
@@ -697,8 +781,16 @@ elif section == "What-if":
                 label_visibility="collapsed",
             )
 
+        if not any(c.startswith("carbs_sum_") for c in feature_cols):
+            st.warning(
+                "Carb scenarios will return 0 effect — the trained model has no "
+                "carb features. Retrain after the next refresh that includes a "
+                "carbs-bearing timeline to make these scenarios meaningful."
+            )
+
     actions = (
         [counterfactual.Action("bolus", units=u) for u in bolus_doses]
+        + [counterfactual.Action("carbs", grams=g) for g in carb_amounts]
         + [counterfactual.Action("suspend", minutes=m) for m in suspend_durations]
     )
 
@@ -710,7 +802,12 @@ elif section == "What-if":
 
     st.subheader("Predicted glucose at +30 min — by scenario")
     fig = go.Figure()
-    colors = ["#1f77b4"] + ["#ff7f0e"] * len(bolus_doses) + ["#2ca02c"] * len(suspend_durations)
+    colors = (
+        ["#1f77b4"]
+        + ["#ff7f0e"] * len(bolus_doses)
+        + ["#9467bd"] * len(carb_amounts)
+        + ["#2ca02c"] * len(suspend_durations)
+    )
     fig.add_trace(go.Bar(
         x=cf["scenario"], y=cf["prediction_30m"],
         marker_color=colors[:len(cf)],

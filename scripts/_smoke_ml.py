@@ -83,6 +83,12 @@ def main() -> int:
     merge_pipeline.run(dexcom_pq, tandem_pq, unified_pq)
     feat_mod.run(unified_pq, features_pq)
 
+    # Carbs should have flowed end-to-end if Tandem provided them.
+    feats_check = pd.read_parquet(features_pq)
+    carb_cols = [c for c in feats_check.columns if c.startswith("carbs_sum_") or c == "minutes_since_carbs"]
+    assert carb_cols, f"expected carb features in feature table, got {list(feats_check.columns)[:6]}..."
+    assert (feats_check["carbs_sum_60m"] > 0).any(), "carbs_sum_60m never non-zero — pump-derived carbs missing"
+
     result = train_mod.run(features_pq, model_dir)
     m = result["metrics"]
     assert m["mae"] < 40, f"MAE suspiciously high: {m['mae']}"

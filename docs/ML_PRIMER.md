@@ -314,3 +314,57 @@ about 27 mg/dL.
 Carbs would be the natural next addition: log them in the UI, add a
 "recent carbs in last N min" feature, retrain, and "what if I eat 30g"
 becomes a real question we can ask.
+
+---
+
+## Carbs (Phase 14)
+
+Carbs are the single highest-impact missing input. The model can see
+that a bolus happened, but if it doesn't know whether 5 g or 50 g of
+carbs went with it, post-meal trajectories look like noise. We close
+this gap from two sides:
+
+### 1. Pump-derived carbs
+
+When the user enters carbs into the Tandem bolus calculator, the
+amount is recorded alongside the bolus event. tconnectsync exposes
+this as `carbsRequest` / `carbsAmount`. We pull it free, no manual
+entry, every refresh cycle. Captures ~all bolused meals.
+
+### 2. Manual log for un-bolused carbs
+
+A child's diabetes data is dominated by **carbs given without a
+bolus** — juice for a low, a few crackers as a snack, mid-correction
+fuel. The pump doesn't see these. The **Log carbs** tab is a
+purpose-built UI for them:
+
+- One-tap quick buttons for the standard low treatments (4/8/15 g).
+- A simple form for meals/snacks with optional notes.
+- Stored append-only in `data/processed/treatments.parquet`.
+
+### Unified into one feature
+
+Both sources merge into a single `carbs_g` column on the 5-min grid.
+The feature engineer then exposes:
+
+- `carbs_sum_15m` / `_30m` / `_60m` / `_120m` — grams in trailing windows.
+- `minutes_since_carbs` — how long since the last carb event.
+
+### Why this should improve the model
+
+1. **Reduces bolus-without-carbs confusion.** Before this, a 2 U
+   bolus could mean either "covering 24 g of carbs" or "correcting
+   a high without a meal" — opposite glucose trajectories. Now the
+   model sees the difference directly.
+2. **Captures low treatments.** The post-low rebound (+30-50 mg/dL
+   over 30 min) was previously "unexplained drift". Now it has a
+   cause.
+3. **Enables carb counterfactuals.** "What if I give 8 g now?"
+   becomes a real question the model can answer — limited, of course,
+   to actions that resemble training data.
+
+### What you have to do once the data accumulates
+
+Retrain. New features only become useful after the model has seen a
+few weeks of data including them. The Model tab's "Train" button is
+the lever; the drift dashboard's recommendation is when to pull it.

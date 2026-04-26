@@ -50,6 +50,11 @@ ROLLING_WINDOWS_MIN = (15, 30, 60, 120)
 # How much past insulin we sum into "recent bolus" features.
 BOLUS_WINDOWS_MIN = (15, 30, 60, 120)
 
+# Same windows for recent carbohydrate intake. Carbs absorb over
+# ~1-3 hours depending on the meal, so 15 / 30 / 60 / 120 cover the
+# range from "just ate" to "still digesting".
+CARBS_WINDOWS_MIN = (15, 30, 60, 120)
+
 
 def _ensure_grid(df: pd.DataFrame) -> pd.DataFrame:
     """Sanity check: the merged timeline must already be on the 5-min grid."""
@@ -104,6 +109,35 @@ def _add_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
         # That's not a *least squares* slope, but it's a fast,
         # noise-robust enough proxy for short windows.
         df[f"glucose_slope_{m}m"] = (glucose - glucose.shift(window - 1)) / max(window - 1, 1)
+    return df
+
+
+def _add_carb_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Carbohydrate-context features.
+
+    Why these matter: a bolus's effect on glucose is *cancelled* by the
+    carbs it was meant to cover. Insulin alone tells the model "glucose
+    should drop"; insulin + matching carbs tells it "glucose should
+    spike then settle". Without the carbs feature, the model has to
+    guess based on time-of-day proxies, which is exactly the
+    'unbolused-meal blind spot' we wanted to fix.
+
+    Source-agnostic: `carbs_g` already aggregates pump-derived carbs
+    (from the bolus calculator) and manually logged carbs (juice,
+    snacks). See src/treatments.py.
+    """
+    if "carbs_g" not in df.columns:
+        df["carbs_g"] = 0.0
+
+    for m in CARBS_WINDOWS_MIN:
+        window = m // 5
+        df[f"carbs_sum_{m}m"] = df["carbs_g"].fillna(0).rolling(window, min_periods=1).sum()
+
+    # "Time since the last carb event" — capped at 8 h because beyond
+    # that the meal's effect is essentially gone.
+    carb_times = df["timestamp"].where(df["carbs_g"].fillna(0) > 0).ffill()
+    minutes_since = ((df["timestamp"] - carb_times).dt.total_seconds() / 60.0).fillna(9999.0)
+    df["minutes_since_carbs"] = minutes_since.clip(upper=480.0)
     return df
 
 
@@ -189,6 +223,7 @@ def build_features(unified: pd.DataFrame) -> pd.DataFrame:
     df = _ensure_grid(unified)
     df = _add_lag_features(df)
     df = _add_rolling_features(df)
+    df = _add_carb_features(df)
     df = _add_insulin_features(df)
     df = _add_time_features(df)
     df = _add_targets(df)

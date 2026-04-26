@@ -28,6 +28,8 @@ src/
   anomaly.py            # Phase 11 — threshold-based alerts on live forecasts
   drift.py              # Phase 12 — rolling MAE/RMSE on logged predictions
   counterfactual.py     # Phase 13 — "what if" simulator over the model
+  treatments.py         # Phase 14 — manual carb log + Tandem-derived carbs
+                        #            unioned into a single carbs_g feature
 scripts/
   _smoke_test.py        # Data-pipeline canary  (Phases 1-4)
   _smoke_ml.py          # ML-pipeline canary    (Phases 5-8)
@@ -271,8 +273,50 @@ counterfactual feature — see `docs/ML_PRIMER.md` and the
 
 ### Live smoke test
 ```bash
-python scripts/_smoke_live.py  # bootstraps with ML smoke, runs 9-13 end-to-end
+python scripts/_smoke_live.py  # bootstraps with ML smoke, runs 9-14 end-to-end
 ```
+
+## Carbs (Phase 14)
+
+The model's biggest blind spot was carbs — particularly **carbs without a
+bolus**, like a juice box for a low. We close it from two sides:
+
+### Pump-derived carbs (free, automatic)
+`ingest_tandem.py` now extracts the carb amount the user entered into
+the bolus calculator (`carbsRequest` / `carbsAmount`), along with the
+food/correction split and BG-at-bolus. These land as new optional
+columns on bolus rows in `tandem_clean.parquet`.
+
+### Manual carb log (`treatments.parquet`)
+For carbs the pump never sees — low treatments, unbolused snacks — the
+**Log carbs** tab in the UI logs them directly:
+
+- Three quick-tap presets (4 g gel, 8 g juice, 15 g standard).
+- A free-form form for meals/snacks/corrections with optional notes.
+- Append-only parquet at `data/processed/treatments.parquet`.
+
+Schema mirrors a Nightscout `treatments` document so a future Phase
+can swap in a Nightscout client without changing the downstream
+pipeline.
+
+### Unified `carbs_g` feature
+`merge_pipeline.py` unions both sources, sums by 5-min bin, and
+emits a `carbs_g` column on the unified timeline. `features.py` then
+derives:
+
+- `carbs_sum_15m`, `carbs_sum_30m`, `carbs_sum_60m`, `carbs_sum_120m`
+- `minutes_since_carbs` (capped at 8 h)
+
+After your first refresh that includes carb data, **retrain the model**
+so it actually learns from carbs. Until then the new features exist but
+the model's `feature_columns.json` doesn't reference them, so they're
+effectively no-ops (the What-if tab warns about this).
+
+### What-if with carbs
+The What-if tab now includes a third action axis — grams of carbs to
+eat now (4 / 8 / 15 / 20 / 30 / 45 / 60). After retraining you can
+ask "what if my kid has 8g of juice right now?" and see the model's
+predicted glucose effect at the 30-min horizon.
 
 ## Deploying on Unraid (Docker)
 

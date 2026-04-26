@@ -133,9 +133,29 @@ def _expand_ciq_actions(events: pd.DataFrame, grid: pd.DatetimeIndex) -> pd.Seri
     return flag
 
 
-def merge(dexcom: pd.DataFrame, tandem: pd.DataFrame) -> pd.DataFrame:
+def _expand_carbs_per_bin(treatments: pd.DataFrame, grid: pd.DatetimeIndex) -> pd.Series:
+    """Sum grams of carbs that landed in each 5-min bin.
+
+    Source-agnostic: treatments can be tandem-bolus-derived, manually
+    logged, or (future) Nightscout. We just sum the grams within the
+    bin so two events at the same time merge into one feature value.
+    """
+    if treatments.empty:
+        return pd.Series(0.0, index=grid, name="carbs_g")
+    s = treatments.set_index("timestamp")["carbs_g"].sort_index().fillna(0.0)
+    binned = s.resample(GRID_FREQ).sum().reindex(grid, fill_value=0.0)
+    return binned.rename("carbs_g")
+
+
+def merge(
+    dexcom: pd.DataFrame,
+    tandem: pd.DataFrame,
+    treatments: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     if dexcom.empty:
         raise ValueError("dexcom dataframe is empty; cannot build a glucose timeline")
+    if treatments is None:
+        treatments = pd.DataFrame(columns=["timestamp", "carbs_g"])
 
     grid_start = min(dexcom["timestamp"].min(), tandem["timestamp"].min() if not tandem.empty else dexcom["timestamp"].min())
     grid_end = max(dexcom["timestamp"].max(), tandem["timestamp"].max() if not tandem.empty else dexcom["timestamp"].max())
@@ -152,6 +172,7 @@ def merge(dexcom: pd.DataFrame, tandem: pd.DataFrame) -> pd.DataFrame:
     basal_series = _expand_basal(basal, grid)
     suspend_flag = _expand_suspends(suspends, grid)
     ciq_flag = _expand_ciq_actions(ciq, grid)
+    carbs_series = _expand_carbs_per_bin(treatments, grid)
 
     # Prefer the pump's own IOB if it exists for any bolus; otherwise
     # fall back to the modeled exponential decay. We resample the pump's
@@ -180,6 +201,7 @@ def merge(dexcom: pd.DataFrame, tandem: pd.DataFrame) -> pd.DataFrame:
             basal_series,
             suspend_flag,
             ciq_flag,
+            carbs_series,
         ]
     )
     out = out.reset_index()
@@ -194,6 +216,7 @@ def merge(dexcom: pd.DataFrame, tandem: pd.DataFrame) -> pd.DataFrame:
         "basal_rate",
         "is_suspended",
         "control_iq_active",
+        "carbs_g",
     ]
     for c in schema_cols:
         if c not in out.columns:
@@ -205,22 +228,45 @@ def merge(dexcom: pd.DataFrame, tandem: pd.DataFrame) -> pd.DataFrame:
     out["iob_units"] = out["iob_units"].astype("float32")
     out["bolus_units"] = out["bolus_units"].astype("float32")
     out["basal_rate"] = out["basal_rate"].astype("float32")
+    out["carbs_g"] = out["carbs_g"].fillna(0.0).astype("float32")
     out["is_suspended"] = out["is_suspended"].fillna(False).astype(bool)
     out["control_iq_active"] = out["control_iq_active"].fillna(False).astype(bool)
 
     return out
 
 
-def run(dexcom_path: Path, tandem_path: Path, output_path: Path) -> pd.DataFrame:
-    logger.info("Loading dexcom=%s tandem=%s", dexcom_path, tandem_path)
+def run(
+    dexcom_path: Path,
+    tandem_path: Path,
+    output_path: Path,
+    treatments_path: Path | None = None,
+) -> pd.DataFrame:
+    logger.info("Loading dexcom=%s tandem=%s treatments=%s", dexcom_path, tandem_path, treatments_path)
     dexcom = pd.read_parquet(dexcom_path)
     tandem = pd.read_parquet(tandem_path) if tandem_path.exists() else pd.DataFrame(
         columns=["timestamp", "event_type", "value", "duration_minutes", "iob_units"]
     )
-    merged = merge(dexcom, tandem)
+
+    # Treatments come from two sources:
+    #   1. tandem_clean.parquet bolus rows that carry a carbs_g value
+    #      (the user used the bolus calculator).
+    #   2. treatments.parquet manually logged events (low treatments,
+    #      unbolused snacks).
+    # We import treatments here lazily so this module stays usable from
+    # tools that don't care about the manual log.
+    from src import treatments as treatments_mod
+
+    derived = treatments_mod.derive_from_tandem(tandem)
+    manual = treatments_mod.load(treatments_path) if treatments_path else treatments_mod.empty_frame()
+    treatments = treatments_mod.union(derived, manual)
+
+    merged = merge(dexcom, tandem, treatments=treatments)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     merged.to_parquet(output_path, index=False)
-    logger.info("Wrote unified timeline (%d rows) to %s", len(merged), output_path)
+    logger.info(
+        "Wrote unified timeline (%d rows, %d carb-tagged bins) to %s",
+        len(merged), int((merged["carbs_g"] > 0).sum()), output_path,
+    )
     return merged
 
 
@@ -228,6 +274,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Merge Dexcom + Tandem parquets onto a 5-min grid.")
     p.add_argument("--dexcom", type=Path, default=Path("data/processed/dexcom_clean.parquet"))
     p.add_argument("--tandem", type=Path, default=Path("data/processed/tandem_clean.parquet"))
+    p.add_argument("--treatments", type=Path, default=Path("data/processed/treatments.parquet"),
+                   help="Manual carb log. Optional — auto-skipped if missing.")
     p.add_argument("-o", "--output", type=Path, default=Path("data/processed/unified_timeline.parquet"))
     p.add_argument("-v", "--verbose", action="store_true")
     return p
@@ -239,7 +287,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.dexcom.exists():
         logger.error("Missing dexcom parquet: %s", args.dexcom)
         return 2
-    run(args.dexcom, args.tandem, args.output)
+    run(args.dexcom, args.tandem, args.output, args.treatments)
     return 0
 
 
